@@ -46,7 +46,7 @@ void processRows(vector<vector<short int>>& matrix, int threadID, int numThreads
                 minIndex = j;
             }
         }
-        string message = to_string(threadID) + " " + to_string(i) + "\n";
+        //string message = to_string(threadID) + " " + to_string(i) + "\n";
         //cout << message;
         //swap(matrix[i][SIZE - 1 - i], matrix[i][minIndex]);
     }
