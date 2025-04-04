@@ -7,6 +7,7 @@
 #include <functional>
 #include <random>
 #include <vector>
+#include <atomic>
 
 using namespace std;
 
@@ -19,8 +20,29 @@ private:
     bool stop = false;
     int workerCount;
 
+    atomic<int> createdThreads;
+    atomic<long long> totalWaitTimeMicroseconds;
+    atomic<int> waitCount;
+    atomic<long long> totalTaskExecTimeMicroseconds;
+    atomic<int> taskCount;
+    atomic<long long> totalQueueLength;
+    atomic<int> queueLengthCount;
+
+    atomic<bool> paused;
+    mutex mtx_pause;
+    condition_variable cv_pause;
+
 public:
-    ThreadPool(int count) : workerCount(count) {
+    ThreadPool(int count) : workerCount(count),
+        createdThreads(0),
+        totalWaitTimeMicroseconds(0),
+        waitCount(0),
+        totalTaskExecTimeMicroseconds(0),
+        taskCount(0),
+        totalQueueLength(0),
+        queueLengthCount(0),
+        paused(false)
+    {
         cout << "[POOL] Thread pool created with " << workerCount << " worker threads.\n";
     }
 
@@ -35,15 +57,30 @@ public:
             return;
         }
         tasks.push(task);
-        cout << "[POOL] Task added to queue. Current queue size: " << tasks.size() << "\n";
+        int q_size = tasks.size();
+        totalQueueLength += q_size;
+        queueLengthCount++;
+        cout << "[POOL] Task added to queue. Current queue size: " << q_size << "\n";
+        cv.notify_all();
     }
 
     void workerFunction(int id) {
+        thread_local bool counted = false;
+        if (!counted) {
+            createdThreads++;
+            counted = true;
+        }
+
         while (true) {
             function<void()> task;
             {
                 unique_lock<mutex> lock(mtx);
-                cv.wait(lock, [this] { return stop || !tasks.empty(); });
+                auto wait_start = chrono::steady_clock::now();
+                cv.wait(lock, [this] { return stop || (!tasks.empty() && !accepting); });
+                auto wait_end = chrono::steady_clock::now();
+                long long wait_micro = chrono::duration_cast<chrono::microseconds>(wait_end - wait_start).count();
+                totalWaitTimeMicroseconds += wait_micro;
+                waitCount++;
 
                 if (stop) {
                     cout << "[WORKER " << id << "] Stopping thread.\n";
@@ -58,8 +95,18 @@ public:
             }
 
             if (task) {
+                {
+                    unique_lock<mutex> pause_lock(mtx_pause);
+                    cv_pause.wait(pause_lock, [this] { return !paused.load(); });
+                }
+
                 cout << "[WORKER " << id << "] Executing task...\n";
+                auto exec_start = chrono::steady_clock::now();
                 task();
+                auto exec_end = chrono::steady_clock::now();
+                long long exec_micro = chrono::duration_cast<chrono::microseconds>(exec_end - exec_start).count();
+                totalTaskExecTimeMicroseconds += exec_micro;
+                taskCount++;
                 cout << "[WORKER " << id << "] Task execution finished.\n";
             }
         }
@@ -78,6 +125,15 @@ public:
         }
         cout << "[POOL] 30 seconds elapsed. Stopping acceptance of new tasks and starting execution.\n";
         cv.notify_all();
+
+        double avgWaitSec = (waitCount > 0) ? (totalWaitTimeMicroseconds.load() / static_cast<double>(waitCount)) / 1e6 : 0.0;
+        double avgTaskExecSec = (taskCount > 0) ? (totalTaskExecTimeMicroseconds.load() / static_cast<double>(taskCount)) / 1e6 : 0.0;
+        double avgQueueLength = (queueLengthCount > 0) ? totalQueueLength.load() / static_cast<double>(queueLengthCount) : 0.0;
+
+        cout << "[STATISTICS] Created threads: " << createdThreads.load() << "\n";
+        cout << "[STATISTICS] Average waiting time per thread: " << avgWaitSec << " seconds\n";
+        cout << "[STATISTICS] Average task execution time: " << avgTaskExecSec << " seconds\n";
+        cout << "[STATISTICS] Average queue length: " << avgQueueLength << "\n";
     }
 
     void stopWorkers() {
@@ -86,6 +142,14 @@ public:
             stop = true;
         }
         cv.notify_all();
+    }
+
+    void setPause(bool p) {
+        paused = p;
+        if (!p) {
+            unique_lock<mutex> lock(mtx_pause);
+            cv_pause.notify_all();
+        }
     }
 };
 
